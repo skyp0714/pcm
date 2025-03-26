@@ -1,0 +1,26 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/hnpark2/ddio/pcm/src/daemon/common.h
+cstring
+-
+stdint.h
+-
+
+/home/hnpark2/ddio/pcm/tests/daemon_alignment_test.cpp
+stdio.h
+-
+cstdlib
+-
+cstdint
+-
+algorithm
+-
+../src/daemon/common.h
+/home/hnpark2/ddio/pcm/src/daemon/common.h
+

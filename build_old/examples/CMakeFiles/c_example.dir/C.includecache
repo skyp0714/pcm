@@ -1,0 +1,18 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/hnpark2/ddio/pcm/examples/c_example.c
+stdio.h
+-
+dlfcn.h
+-
+stdint.h
+-
+stdlib.h
+-
+

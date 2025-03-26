@@ -138,7 +138,7 @@ inline std::string unit_format(IntType n)
         snprintf(buffer, 1024, "%4d K", int32(n / 1000ULL));
         return std::string{buffer};
     }
-    if (n <= 9999999999ULL)
+    if (n <= 9999999999999ULL)
     {
         snprintf(buffer, 1024, "%4d M", int32(n / 1000000ULL));
         return std::string{buffer};

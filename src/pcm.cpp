@@ -116,11 +116,15 @@ void print_basic_metrics(const PCM * m, const State & state1, const State & stat
         cout << "    " << unit_format(getL3CacheMisses(state1, state2));
     if (m->isL2CacheMissesAvailable())
         cout << "   " << unit_format(getL2CacheMisses(state1, state2));
+    if (m->isL3CacheHitsAvailable())
+        cout << "   " << unit_format(getL3CacheHits(state1, state2));
+    if (m->isL2CacheHitsAvailable())
+        cout << "   " << unit_format(getL2CacheHits(state1, state2));
+    cout.precision(4);
     if (m->isL3CacheHitRatioAvailable())
         cout << "    " << getL3CacheHitRatio(state1, state2);
     if (m->isL2CacheHitRatioAvailable())
         cout << "    " << getL2CacheHitRatio(state1, state2);
-    cout.precision(4);
     if (m->isL3CacheMissesAvailable())
         cout << "  " << double(getL3CacheMisses(state1, state2)) / getInstructionsRetired(state1, state2);
     if (m->isL2CacheMissesAvailable())
@@ -170,10 +174,14 @@ void print_output(PCM * m,
         else
             cout << " L2MISS: L2 (read) cache misses (including other core's L2 cache *hits*) \n";
     }
+    if (m->isL3CacheHitsAvailable())
+        cout << " L3HIT: L3 (read) cache hits \n";
+    if (m->isL2CacheHitsAvailable())
+        cout << " L2HIT: L2 (read) cache hits \n";
     if (m->isL3CacheHitRatioAvailable())
-        cout << " L3HIT : L3 (read) cache hit ratio (0.00-1.00)\n";
+        cout << " L3HR : L3 (read) cache hit ratio (0.00-1.00)\n";
     if (m->isL2CacheHitRatioAvailable())
-        cout << " L2HIT : L2 cache hit ratio (0.00-1.00)\n";
+        cout << " L2HR : L2 cache hit ratio (0.00-1.00)\n";
     if (m->isL3CacheMissesAvailable())
         cout << " L3MPI : number of L3 (read) cache misses per instruction\n";
     if (m->isL2CacheMissesAvailable())
@@ -214,10 +222,14 @@ void print_output(PCM * m,
         cout << " L3MISS |";
     if (m->isL2CacheMissesAvailable())
         cout << " L2MISS |";
-    if (m->isL3CacheHitRatioAvailable())
+    if (m->isL3CacheHitsAvailable())
         cout << " L3HIT |";
-    if (m->isL2CacheHitRatioAvailable())
+    if (m->isL2CacheHitsAvailable())
         cout << " L2HIT |";
+    if (m->isL3CacheHitRatioAvailable())
+        cout << " L3HR |";
+    if (m->isL2CacheHitRatioAvailable())
+        cout << " L2HR |";
     if (m->isL3CacheMissesAvailable())
         cout << " L3MPI |";
     if (m->isL2CacheMissesAvailable())
@@ -528,10 +540,14 @@ void print_basic_metrics_csv_header(const PCM * m)
         cout << "L3MISS,";
     if (m->isL2CacheMissesAvailable())
         cout << "L2MISS,";
-    if (m->isL3CacheHitRatioAvailable())
+    if (m->isL3CacheHitsAvailable())
         cout << "L3HIT,";
-    if (m->isL2CacheHitRatioAvailable())
+    if (m->isL2CacheHitsAvailable())
         cout << "L2HIT,";
+    if (m->isL3CacheHitRatioAvailable())
+        cout << "L3HR,";
+    if (m->isL2CacheHitRatioAvailable())
+        cout << "L2HR,";
     if (m->isL3CacheMissesAvailable())
         cout << "L3MPI,";
     if (m->isL2CacheMissesAvailable())
@@ -555,10 +571,14 @@ void print_basic_metrics_csv_semicolons(const PCM * m, const string & header)
         print_csv_header_helper(header);  // L3MISS;
     if (m->isL2CacheMissesAvailable())
         print_csv_header_helper(header);  // L2MISS;
-    if (m->isL3CacheHitRatioAvailable())
-        print_csv_header_helper(header);  // L3HIT
-    if (m->isL2CacheHitRatioAvailable())
+    if (m->isL3CacheHitsAvailable())
+        print_csv_header_helper(header);  // L3HIT;
+    if (m->isL2CacheHitsAvailable())
         print_csv_header_helper(header);  // L2HIT;
+    if (m->isL3CacheHitRatioAvailable())
+        print_csv_header_helper(header);  // L3HR
+    if (m->isL2CacheHitRatioAvailable())
+        print_csv_header_helper(header);  // L2HR;
     if (m->isL3CacheMissesAvailable())
         print_csv_header_helper(header);  // L3MPI;
     if (m->isL2CacheMissesAvailable())
@@ -1177,6 +1197,8 @@ int mainThrows(int argc, char * argv[])
 
     PCM * m = PCM::getInstance();
 
+    // Enable force mode
+    m->enableForceRTMAbortMode();
     if (argc > 1) do
     {
         argv++;
