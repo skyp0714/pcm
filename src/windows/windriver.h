@@ -100,16 +100,15 @@ public:
             {
                 if (0 != StartService(hService, 0, NULL))
                 {
-                    tstring convDriverName(&driverName_[0]);
-                    tstring driverPath = TEXT("\\\\.\\") + convDriverName;
-                    restrictDriverAccess(driverPath.c_str());
+                    restrictDriverAccess(PCM_MSR_DRV_NAME);
                     return true;
                 }
                 DWORD err = GetLastError();
                 if (err == ERROR_SERVICE_ALREADY_RUNNING) return true;
 
                 std::wcerr << "Starting MSR service failed with error " << err << " ";
-                const TCHAR * errorStr = _com_error(err).ErrorMessage();
+                const _com_error comError{ (int)err };
+                const TCHAR * errorStr = comError.ErrorMessage();
                 if (errorStr)
                     std::wcerr << errorStr << "\n";
 
@@ -122,7 +121,8 @@ public:
             else
             {
                 std::wcerr << "Opening service manager failed with error " << GetLastError() << " ";
-                const TCHAR * errorStr = _com_error(GetLastError()).ErrorMessage();
+                const _com_error comError{ (int)GetLastError() };
+                const TCHAR * errorStr = comError.ErrorMessage();
                 if (errorStr)
                     std::wcerr << errorStr << "\n";
             }
@@ -132,7 +132,8 @@ public:
         else
         {
             std::wcerr << "Opening service manager failed with error " << GetLastError() << " ";
-            const TCHAR * errorStr = _com_error(GetLastError()).ErrorMessage();
+            const _com_error comError{ (int)GetLastError() };
+            const TCHAR * errorStr = comError.ErrorMessage();
             if (errorStr)
                 std::wcerr << errorStr << "\n";
         }
@@ -171,7 +172,8 @@ public:
         else
         {
             std::wcerr << "Opening service manager failed with error " << GetLastError() << " ";
-            const TCHAR * errorStr = _com_error(GetLastError()).ErrorMessage();
+            const _com_error comError{ (int)GetLastError() };
+            const TCHAR * errorStr = comError.ErrorMessage();
             if (errorStr)
                 std::wcerr << errorStr;
         }
@@ -199,7 +201,8 @@ public:
         else
         {
             std::wcerr << "Opening service manager failed with error " << GetLastError() << " ";
-            const TCHAR * errorStr = _com_error(GetLastError()).ErrorMessage();
+            const _com_error comError{ (int)GetLastError() };
+            const TCHAR * errorStr = comError.ErrorMessage();
             if (errorStr)
                 std::wcerr << errorStr;
         }

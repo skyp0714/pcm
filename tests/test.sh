@@ -1,5 +1,6 @@
 modprobe msr
 
+export PCM_ENFORCE_MBM="1"
 export BIN_DIR="build/bin"
 
 pushd $BIN_DIR
@@ -21,8 +22,22 @@ if [ "$?" -ne "0" ]; then
    exit 1
 fi
 
+echo Testing pcm with PCM_DEBUG_LEVEL=100
+PCM_DEBUG_LEVEL=100 ./pcm -r -- sleep 1
+if [ "$?" -ne "0" ]; then
+   echo "Error in pcm"
+   exit 1
+fi
+
 echo Testing pcm w/o env vars
 ./pcm -r -- sleep 1
+if [ "$?" -ne "0" ]; then
+   echo "Error in pcm"
+   exit 1
+fi
+
+echo Testing pcm w/o env vars + color
+./pcm -r --color -- sleep 1
 if [ "$?" -ne "0" ]; then
    echo "Error in pcm"
    exit 1
@@ -116,6 +131,13 @@ if [ "$?" -ne "0" ]; then
     exit 1
 fi
 
+echo Testing pcm-tpmi
+./pcm-tpmi 2 0x10 -d -b 26:26
+if [ "$?" -ne "0" ]; then
+    echo "Error in pcm-tpmi"
+    exit 1
+fi
+
 echo Testing pcm-numa
 ./pcm-numa -- sleep 1
 if [ "$?" -ne "0" ]; then
@@ -131,7 +153,8 @@ if [ "$?" -ne "0" ]; then
 fi
 
 echo Testing c_example
-./examples/c_example
+# see https://github.com/google/sanitizers/issues/934
+LD_PRELOAD="$(realpath "$(gcc -print-file-name=libasan.so)") $(realpath "$(gcc -print-file-name=libstdc++.so)")" LD_LIBRARY_PATH=../lib/ ./examples/c_example
 if [ "$?" -ne "0" ]; then
     echo "Error in c_example"
     exit 1
@@ -157,6 +180,9 @@ if [ "$?" -ne "0" ]; then
     echo "Error in pcm-power"
     exit 1
 fi
+
+echo "/sys/fs/cgroup/cpuset/cpuset.cpus:"
+cat /sys/fs/cgroup/cpuset/cpuset.cpus
 
 echo Testing pcm-pcie
 ./pcm-pcie -- sleep 1
@@ -319,6 +345,7 @@ UNC_UPI_TxL0P_POWER_CYCLES
 UNC_UPI_RxL0P_POWER_CYCLES
 UNC_UPI_RxL_FLITS.ALL_DATA
 UNC_UPI_RxL_FLITS.NON_DATA
+UNC_P_FREQ_MAX_LIMIT_THERMAL_CYCLES
 MSR_EVENT:msr=0x10:type=FREERUN:scope=thread
 MSR_EVENT:msr=0x10:type=static:scope=thread
 pcicfg/config=0x2021,config1=4,config2=0,width=32

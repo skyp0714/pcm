@@ -91,6 +91,7 @@ void print_usage(const string & progname)
 
 bool verbose = false;
 double defaultDelay = 1.0; // in seconds
+TelemetryDB telemDB;
 
 PCM::RawEventConfig initCoreConfig()
 {
@@ -132,6 +133,10 @@ enum AddEventStatus
 
 bool tooManyEvents(const std::string & pmuName, const int event_pos, const std::string& fullEventStr)
 {
+    if (isRegisterEvent(pmuName))
+    {
+        return false;
+    }
     PCM* m = PCM::getInstance();
     assert(m);
     const int maxCounters = (pmuName == "core" || pmuName == "atom") ? m->getMaxCustomCoreEvents() : ServerUncoreCounterState::maxCounters;
@@ -218,7 +223,9 @@ bool initPMUEventMap()
     if (!in.is_open())
     {
         cerr << "ERROR: File " << mapfilePath << " can't be open. \n";
-        cerr << "       Download it from https://raw.githubusercontent.com/intel/perfmon/main/" << mapfile << " \n";
+        cerr << "       Use -ep <pcm_source_directory>/perfmon option if you cloned PCM source repository recursively with submodules,\n";
+        cerr << "       or run 'git clone https://github.com/intel/perfmon' to download the perfmon event repository and use -ep <perfmon_directory> option\n";
+        cerr << "       or download the file from https://raw.githubusercontent.com/intel/perfmon/main/" << mapfile << " \n";
         return false;
     }
     int32 FMSPos = -1;
@@ -541,21 +548,45 @@ AddEventStatus addEventFromDB(PCM::RawPMUConfigs& curPMUConfigs, string fullEven
 
     bool fixed = false;
     static size_t offcoreEventIndex = 0;
+    auto * pcm = PCM::getInstance();
+    assert(pcm);
 
-    const std::string path = std::string("PMURegisterDeclarations/") + PCM::getInstance()->getCPUFamilyModelString() + ".json";
+    int stepping = pcm->getCPUStepping();
+    assert(stepping >= 0);
+    std::string path, err_msg;
 
-    std::ifstream in(path);
-    if (!in.is_open())
+    for (; stepping >= 0; --stepping)
     {
-        const auto alt_path = std::string("/usr/share/pcm/") + path;
-        in.open(alt_path);
-        if (!in.is_open())
+        try
         {
-            const auto err_msg = std::string("event file ") + path + " or " + alt_path + " is not available.";
-            throw std::invalid_argument(err_msg);
+            path = std::string("PMURegisterDeclarations/") + pcm->getCPUFamilyModelString(pcm->getCPUFamily(), pcm->getInternalCPUModel(), (uint32)stepping) + ".json";
+
+            std::ifstream in(path);
+            if (!in.is_open())
+            {
+                const auto alt_path = getInstallPathPrefix() + path;
+                in.open(alt_path);
+                if (!in.is_open())
+                {
+                    err_msg = std::string("event file ") + path + " or " + alt_path + " is not available.";
+                    throw std::invalid_argument(err_msg);
+                }
+                path = alt_path;
+            }
+            in.close();
+            break;
+        }
+        catch (std::invalid_argument & e)
+        {
+            std::cerr << "INFO: " << e.what() << "\n";
+            path.clear();
         }
     }
-    in.close();
+
+    if (path.empty())
+    {
+        throw std::invalid_argument(err_msg);
+    }
 
     if (PMURegisterDeclarations.get() == nullptr)
     {
@@ -575,8 +606,10 @@ AddEventStatus addEventFromDB(PCM::RawPMUConfigs& curPMUConfigs, string fullEven
 
     static std::map<std::string, std::string> pmuNameMap = {
         {std::string("cbo"), std::string("cha")},
+        {std::string("b2cmi"), std::string("m2m")},
         {std::string("upi"), std::string("xpi")},
         {std::string("upi ll"), std::string("xpi")},
+        {std::string("b2upi"), std::string("m3upi")},
         {std::string("qpi"), std::string("xpi")},
         {std::string("qpi ll"), std::string("xpi")}
     };
@@ -644,9 +677,7 @@ AddEventStatus addEventFromDB(PCM::RawPMUConfigs& curPMUConfigs, string fullEven
                 if (cfg >= config.first.size()) throw std::runtime_error("Config field value is out of bounds");
                 const auto width = uint64_t(fieldDescriptionObj["Width"]);
                 assert(width <= 64);
-                const uint64 mask = (width == 64) ? (~0ULL) : ((1ULL << width) - 1ULL); // 1 -> 1b, 2 -> 11b, 3 -> 111b
-                config.first[cfg] &= ~(mask << position); // clear
-                config.first[cfg] |= (value & mask) << position;
+                config.first[cfg] = insertBits(config.first[cfg], value, position, width);
             };
             auto PMUObj = (*PMURegisterDeclarations)[pmuName];
             if (PMUObj.error() == NO_SUCH_FIELD)
@@ -756,6 +787,8 @@ AddEventStatus addEventFromDB(PCM::RawPMUConfigs& curPMUConfigs, string fullEven
             std::regex CounterMaskRegex("c(0x[0-9a-fA-F]+|[[:digit:]]+)");
             std::regex UmaskRegex("u(0x[0-9a-fA-F]+|[[:digit:]]+)");
             std::regex EdgeDetectRegex("e(0x[0-9a-fA-F]+|[[:digit:]]+)");
+            std::regex AnyThreadRegex("amt(0x[0-9a-fA-F]+|[[:digit:]]+)");
+            std::regex InvertRegex("i(0x[0-9a-fA-F]+|[[:digit:]]+)");
             while (mod != EventTokens.end())
             {
                 const auto assignment = split(*mod, '=');
@@ -798,6 +831,18 @@ AddEventStatus addEventFromDB(PCM::RawPMUConfigs& curPMUConfigs, string fullEven
                     const std::string Str{ mod->begin() + 1, mod->end() };
                     setField("EdgeDetect", read_number(Str.c_str()));
                 }
+                else if (std::regex_match(mod->c_str(), AnyThreadRegex))
+                {
+                    // AnyThread modifier
+                    const std::string Str{ mod->begin() + 1, mod->end() };
+                    setField("AnyThread", read_number(Str.c_str()));
+                }
+                else if (std::regex_match(mod->c_str(), InvertRegex))
+                {
+                    // Invert modifier
+                    const std::string Str{ mod->begin() + 1, mod->end() };
+                    setField("Invert", read_number(Str.c_str()));
+                }
                 else if (std::regex_match(mod->c_str(), UmaskRegex))
                 {
                     // UMask modifier
@@ -821,6 +866,22 @@ AddEventStatus addEventFromDB(PCM::RawPMUConfigs& curPMUConfigs, string fullEven
                 else if (assignment.size() == 2 && assignment[0] == "filter1")
                 {
                     setField("Filter1", read_number(assignment[1].c_str()));
+                }
+                else if (assignment.size() == 2 && assignment[0] == "opc")
+                {
+                    setField("OPC", read_number(assignment[1].c_str()));
+                }
+                else if (assignment.size() == 2 && assignment[0] == "nc")
+                {
+                    setField("NC", read_number(assignment[1].c_str()));
+                }
+                else if (assignment.size() == 2 && assignment[0] == "isoc")
+                {
+                    setField("ISOC", read_number(assignment[1].c_str()));
+                }
+                else if (assignment.size() == 2 && assignment[0] == "state")
+                {
+                    setField("State", read_number(assignment[1].c_str()));
                 }
                 else if (assignment.size() == 2 && assignment[0] == "t")
                 {
@@ -913,6 +974,37 @@ AddEventStatus addEvent(PCM::RawPMUConfigs & curPMUConfigs, string eventStr)
     }
     const auto configArray = split(configStr, ',');
     bool fixed = false;
+    std::string lookup;
+    auto pmtAddRecord = [&lookup, &pmuName, &config](const std::vector<TelemetryDB::PMTRecord> & records) -> AddEventStatus
+    {
+        if (pmuName == "pmt")
+        {
+                if (records.empty())
+                {
+                    cerr << "ERROR: lookup \"" << lookup << "\" not found in PMT telemetry database\n";
+                    return AddEventStatus::Failed;
+                }
+                if (records.size() > 1)
+                {
+                    cerr << "ERROR: lookup \"" << lookup << "\" is ambiguous in PMT telemetry database\n\n";
+                    for (const auto & record : records)
+                    {
+                        cerr << "  ";
+                        record.print(cerr);
+                        cerr << "\n";
+                    }
+                    return AddEventStatus::Failed;
+                }
+                config.second = records[0].fullName;
+                assert(records.size() == 1);
+                config.first[PCM::PMTEventPosition::UID] = records[0].uid;
+                config.first[PCM::PMTEventPosition::offset] = records[0].qWordOffset;
+                config.first[PCM::PMTEventPosition::type] = (records[0].sampleType == "Snapshot") ? PCM::MSRType::Static : PCM::MSRType::Freerun;
+                config.first[PCM::PMTEventPosition::lsb] = records[0].lsb;
+                config.first[PCM::PMTEventPosition::msb] = records[0].msb;
+        }
+        return AddEventStatus::OK;
+    };
     for (const auto & item : configArray)
     {
         if (match(item, "config=", &config.first[0]))
@@ -947,6 +1039,16 @@ AddEventStatus addEvent(PCM::RawPMUConfigs & curPMUConfigs, string eventStr)
         {
             // matched and initialized name
             if (check_for_injections(config.second))
+                return AddEventStatus::Failed;
+        }
+        else if (pcm_sscanf(item) >> s_expect("lookup=") >> setw(255) >> lookup)
+        {
+            if (pmtAddRecord(telemDB.lookup(lookup)) != AddEventStatus::OK)
+                return AddEventStatus::Failed;
+        }
+        else if (pcm_sscanf(item) >> s_expect("ilookup=") >> setw(255) >> lookup)
+        {
+            if (pmtAddRecord(telemDB.ilookup(lookup)) != AddEventStatus::OK)
                 return AddEventStatus::Failed;
         }
         else if (item == "fixed")
@@ -1147,7 +1249,8 @@ uint64 nullFixedMetricFunc(const uint32, const ServerUncoreCounterState&, const 
 }
 
 const char* fixedCoreEventNames[] = { "InstructionsRetired" , "Cycles", "RefCycles", "TopDownSlots" };
-const char* topdownEventNames[] = { "PERF_METRICS.FRONTEND_BOUND" , "PERF_METRICS.BAD_SPECULATION", "PERF_METRICS.BACKEND_BOUND", "PERF_METRICS.RETIRING" };
+const char* topdownEventNames[] = { "PERF_METRICS.FRONTEND_BOUND" , "PERF_METRICS.BAD_SPECULATION", "PERF_METRICS.BACKEND_BOUND", "PERF_METRICS.RETIRING",
+                                    "PERF_METRICS.HEAVY_OPERATIONS", "PERF_METRICS.BRANCH_MISPREDICTS", "PERF_METRICS.FETCH_LATENCY", "PERF_METRICS.MEMORY_BOUND"};
 constexpr uint32 PerfMetricsConfig = 2;
 constexpr uint64 PerfMetricsMask = 1ULL;
 constexpr uint64 maxPerfMetricsValue = 255ULL;
@@ -1167,23 +1270,69 @@ const char * getTypeString(uint64 typeID)
 std::string getMSREventString(const uint64 & index, const std::string & type, const PCM::MSRType & msrType)
 {
     std::stringstream c;
-    c << type << ":0x" << std::hex << index << ":" << getTypeString(msrType);
+    c << type << "/MSR 0x" << std::hex << index << "/" << getTypeString(msrType);
+    return c.str();
+}
+
+std::string getTPMIEventString(const PCM::RawEventEncoding & eventEnc, const std::string& type)
+{
+    std::stringstream c;
+    c << type << "/TPMI_ID 0x" << std::hex << eventEnc[PCM::TPMIEventPosition::ID]
+              << "/offset 0x" << eventEnc[PCM::TPMIEventPosition::offset] << "/"
+        << getTypeString(eventEnc[PCM::TPMIEventPosition::type]);
     return c.str();
 }
 
 std::string getPCICFGEventString(const PCM::RawEventEncoding & eventEnc, const std::string& type)
 {
     std::stringstream c;
-    c << type << ":0x" << std::hex << eventEnc[PCM::PCICFGEventPosition::deviceID] << ":0x" << eventEnc[PCM::PCICFGEventPosition::offset] << ":0x" << eventEnc[PCM::PCICFGEventPosition::width] << ":"
+    c << type << "/deviceID 0x" << std::hex << eventEnc[PCM::PCICFGEventPosition::deviceID]
+              << "/offset 0x" << eventEnc[PCM::PCICFGEventPosition::offset]
+              << "/width 0x" << eventEnc[PCM::PCICFGEventPosition::width] << "/"
         << getTypeString(eventEnc[PCM::PCICFGEventPosition::type]);
     return c.str();
 }
+
+std::string getMMIOEventString(const PCM::RawEventEncoding& eventEnc, const std::string& type)
+{
+    std::stringstream c;
+    c << type << "/deviceID 0x" << std::hex <<
+                          eventEnc[PCM::MMIOEventPosition::deviceID] <<
+                 "/offset 0x" << eventEnc[PCM::MMIOEventPosition::offset] <<
+                 "/membar_bits1 0x" << eventEnc[PCM::MMIOEventPosition::membar_bits1] <<
+                 "/membar_bits2 0x" << eventEnc[PCM::MMIOEventPosition::membar_bits2] <<
+                 "/width 0x" << eventEnc[PCM::MMIOEventPosition::width] <<
+                 "/" << getTypeString(eventEnc[PCM::MMIOEventPosition::type]);
+    return c.str();
+}
+
+std::string getPMTEventString(const PCM::RawEventEncoding& eventEnc, const std::string& type)
+{
+    std::stringstream c;
+    c << type << "/UID 0x" << std::hex <<
+                          eventEnc[PCM::PMTEventPosition::UID] <<
+                 "/offset 0x" << eventEnc[PCM::PMTEventPosition::offset] <<
+                 "/lsb 0x" << eventEnc[PCM::PMTEventPosition::lsb] <<
+                 "/msb 0x" << eventEnc[PCM::PMTEventPosition::msb] <<
+                 "/" << getTypeString(eventEnc[PCM::PMTEventPosition::type]);
+    return c.str();
+}
+
+typedef std::string(*getEventStringFunc)(const PCM::RawEventEncoding& eventEnc, const std::string& type);
+typedef std::vector<uint64>(getEventFunc)(const PCM::RawEventEncoding& eventEnc, const SystemCounterState& before, const SystemCounterState& after);
 
 enum MSRScope
 {
     Thread,
     Package
 };
+
+uint32 numTMAEvents(PCM* m)
+{
+    return (m->isHWTMAL2Supported() ? 8 : 4);
+}
+
+uint32 pmu_type = PCM::INVALID_PMU_ID;
 
 void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
     PCM* m,
@@ -1422,7 +1571,15 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
                 static FuncType funcTopDown[] = { [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getFrontendBound(before, after) * maxPerfMetricsValue); },
                               [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getBadSpeculation(before, after) * maxPerfMetricsValue); },
                               [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getBackendBound(before, after) * maxPerfMetricsValue); },
-                              [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getRetiring(before, after) * maxPerfMetricsValue); }
+                              [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getRetiring(before, after) * maxPerfMetricsValue); },
+                              // "PERF_METRICS.HEAVY_OPERATIONS" :
+                              [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getHeavyOperationsBound(before, after) * maxPerfMetricsValue); },
+                              // "PERF_METRICS.BRANCH_MISPREDICTS" :
+                              [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getBranchMispredictionBound(before, after) * maxPerfMetricsValue); },
+                              // "PERF_METRICS.FETCH_LATENCY" :
+                              [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getFetchLatencyBound(before, after) * maxPerfMetricsValue); },
+                              // "PERF_METRICS.MEMORY_BOUND" :
+                              [](const CoreCounterState& before, const CoreCounterState& after) { return uint64(getMemoryBound(before, after) * maxPerfMetricsValue); }
                 };
                 for (const auto& event : fixedEvents)
                 {
@@ -1440,7 +1597,7 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
 
                             if (cnt == 3 && (event.first[PerfMetricsConfig] & PerfMetricsMask))
                             {
-                                for (uint32 t = 0; t < 4; ++t)
+                                for (uint32 t = 0; t < numTMAEvents(m); ++t)
                                 {
                                     printRow(topdownEventNames[t], funcTopDown[t], BeforeState, AfterState, m, outputType, printOffset, coreType, type);
                                 }
@@ -1462,28 +1619,12 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
                         is_header_printed = true;
                 }
             };
-            if (type == "core")
-            {
-                printCores(pcm::TopologyEntry::Core);
-            }
-            else if (type == "atom")
-            {
-                printCores(pcm::TopologyEntry::Atom);
-            }
-            else if (type == "thread_msr")
-            {
-                printMSRRows(MSRScope::Thread);
-            }
-            else if (type == "package_msr")
-            {
-                printMSRRows(MSRScope::Package);
-            }
-            else if (type == "pcicfg")
+            auto printRegisterRows = [&](getEventStringFunc getEventString, getEventFunc getEvent)
             {
                 auto printRegister = [&](const PCM::RawEventConfig& event) -> bool
                 {
-                    const std::string name = (event.second.empty()) ? getPCICFGEventString(event.first, type) : event.second;
-                    const auto values = getPCICFGEvent(event.first, SysBeforeState, SysAfterState);
+                    const std::string name = (event.second.empty()) ? getEventString(event.first, type) : event.second;
+                    const auto values = getEvent(event.first, SysBeforeState, SysAfterState);
 
                     if (is_header && is_header_printed)
                         return false;
@@ -1541,6 +1682,38 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
                         break;
                     }
                 }
+            };
+            if (type == "core")
+            {
+                printCores(pcm::TopologyEntry::Core);
+            }
+            else if (type == "atom")
+            {
+                printCores(pcm::TopologyEntry::Atom);
+            }
+            else if (type == "thread_msr")
+            {
+                printMSRRows(MSRScope::Thread);
+            }
+            else if (type == "package_msr")
+            {
+                printMSRRows(MSRScope::Package);
+            }
+            else if (type == "tpmi")
+            {
+                printRegisterRows(getTPMIEventString, getTPMIEvent);
+            }
+            else if (type == "pcicfg")
+            {
+                printRegisterRows(getPCICFGEventString, getPCICFGEvent);
+            }
+            else if (type == "mmio")
+            {
+                printRegisterRows(getMMIOEventString, getMMIOEvent);
+            }
+            else if (type == "pmt")
+            {
+                printRegisterRows(getPMTEventString, getPMTEvent);
             }
             else if (type == "m3upi")
             {
@@ -1560,11 +1733,12 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
             }
             else if (type == "imc")
             {
+                const std::string fixedEventName = (fixedEvents.empty() == false && fixedEvents[0].second.empty() == false) ? fixedEvents[0].second : "DRAMClocks";
                 choose(outputType,
                     [&]() { printUncoreRows(nullptr, (uint32) m->getMCChannelsPerSocket(), "CHAN"); },
                     [&]() { printUncoreRows(nullptr, (uint32) m->getMCChannelsPerSocket(), type); },
                     [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getMCCounter(u, i, before, after); }, (uint32)m->getMCChannelsPerSocket(),
-                            "DRAMClocks", [](const uint32 u, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getDRAMClocks(u, before, after); });
+                        fixedEventName, [](const uint32 u, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getDRAMClocks(u, before, after); });
                     });
             }
             else if (type == "m2m")
@@ -1575,12 +1749,20 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
                     [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getM2MCounter(u, i, before, after); }, (uint32)m->getMCPerSocket(), "MC");
                     });
             }
+            else if (type == "ha")
+            {
+                choose(outputType,
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMCPerSocket(), "HA"); },
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMCPerSocket(), type); },
+                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getHACounter(u, i, before, after); }, (uint32)m->getMCPerSocket(), "HA");
+                    });
+            }
             else if (type == "pcu")
             {
                 choose(outputType,
-                    [&]() { printUncoreRows(nullptr, 1U, ""); },
-                    [&]() { printUncoreRows(nullptr, 1U, type); },
-                    [&]() { printUncoreRows([](const uint32, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getPCUCounter(i, before, after); }, 1U, "");
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(PCM::PCU_PMU_ID), "P"); },
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(PCM::PCU_PMU_ID), type); },
+                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUncoreCounter(PCM::PCU_PMU_ID, u, i, before, after); }, 1U, "");
                     });
             }
             else if (type == "ubox")
@@ -1588,24 +1770,24 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
                 choose(outputType,
                     [&]() { printUncoreRows(nullptr, 1U, ""); },
                     [&]() { printUncoreRows(nullptr, 1U, type); },
-                    [&]() { printUncoreRows([](const uint32, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUBOXCounter(i, before, after); }, 1U,
+                    [&]() { printUncoreRows([](const uint32, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUncoreCounter(PCM::UBOX_PMU_ID, 0, i, before, after); }, 1U,
                             "UncoreClocks", [](const uint32, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUncoreClocks(before, after); });
                     });
             }
             else if (type == "cbo" || type == "cha")
             {
                 choose(outputType,
-                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfCBoxes(), "C"); },
-                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfCBoxes(), type); },
-                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getCBOCounter(u, i, before, after); }, (uint32)m->getMaxNumOfCBoxes(), "C");
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(PCM::CBO_PMU_ID), "C"); },
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(PCM::CBO_PMU_ID), type); },
+                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUncoreCounter(PCM::CBO_PMU_ID, u, i, before, after); }, (uint32)m->getMaxNumOfUncorePMUs(PCM::CBO_PMU_ID), "C");
                     });
             }
             else if (type == "mdf")
             {
                 choose(outputType,
-                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfMDFs(), "MDF"); },
-                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfMDFs(), type); },
-                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getMDFCounter(u, i, before, after); }, (uint32)m->getMaxNumOfMDFs(), "MDF");
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(PCM::MDF_PMU_ID), "MDF"); },
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(PCM::MDF_PMU_ID), type); },
+                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUncoreCounter(PCM::MDF_PMU_ID, u, i, before, after); }, (uint32)m->getMaxNumOfUncorePMUs(PCM::MDF_PMU_ID), "MDF");
                     });
             }
             else if (type == "irp")
@@ -1638,6 +1820,14 @@ void printTransposed(const PCM::RawPMUConfigs& curPMUConfigs,
                     [&]() { printUncoreRows(nullptr, (uint32) ServerUncoreCounterState::maxCXLPorts, "CXLDP"); },
                     [&]() { printUncoreRows(nullptr, (uint32) ServerUncoreCounterState::maxCXLPorts, type); },
                     [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getCXLDPCounter(u, i, before, after); }, ServerUncoreCounterState::maxCXLPorts, "CXLDP");
+                    });
+            }
+            else if ((pmu_type = m->strToUncorePMUID(type)) != PCM::INVALID_PMU_ID)
+            {
+                choose(outputType,
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(pmu_type), type); },
+                    [&]() { printUncoreRows(nullptr, (uint32) m->getMaxNumOfUncorePMUs(pmu_type), type); },
+                    [&]() { printUncoreRows([](const uint32 u, const uint32 i, const ServerUncoreCounterState& before, const ServerUncoreCounterState& after) { return getUncoreCounter(pmu_type, u, i, before, after); }, (uint32)m->getMaxNumOfUncorePMUs(pmu_type), type);
                     });
             }
             else
@@ -1701,7 +1891,11 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                     uint64(getFrontendBound(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
                     uint64(getBadSpeculation(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
                     uint64(getBackendBound(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
-                    uint64(getRetiring(BeforeState[core], AfterState[core]) * maxPerfMetricsValue)
+                    uint64(getRetiring(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
+                    uint64(getHeavyOperationsBound(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
+                    uint64(getBranchMispredictionBound(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
+                    uint64(getFetchLatencyBound(BeforeState[core], AfterState[core]) * maxPerfMetricsValue),
+                    uint64(getMemoryBound(BeforeState[core], AfterState[core]) * maxPerfMetricsValue)
                 };
                 for (const auto& event : fixedEvents)
                 {
@@ -1719,7 +1913,7 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                             print(event.second.empty() ? fixedCoreEventNames[cnt] : event.second, fixedCtrValues[cnt]);
                             if (cnt == 3 && (event.first[PerfMetricsConfig] & PerfMetricsMask))
                             {
-                                for (uint32 t = 0; t < 4; ++t)
+                                for (uint32 t = 0; t < numTMAEvents(m); ++t)
                                 {
                                     print(topdownEventNames[t], topdownCtrValues[t]);
                                 }
@@ -1736,6 +1930,28 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                         [&]() { cout << getNumberOfCustomEvents(i, BeforeState[core], AfterState[core]) << separator; });
                     ++i;
                 }
+            }
+        };
+        auto printRegisters = [&](getEventStringFunc getEventString, getEventFunc getEvent)
+        {
+            auto printOneRegister = [&](const PCM::RawEventConfig& event)
+            {
+                const auto values = getEvent(event.first, SysBeforeState, SysAfterState);
+                for (size_t r = 0; r < values.size(); ++r)
+                {
+                    choose(outputType,
+                        [&r]() { cout << "SYSTEM_" << r << separator; },
+                        [&]() { if (event.second.empty()) cout << getEventString(event.first, type) << separator;  else cout << event.second << separator; },
+                        [&]() { cout << values[r] << separator; });
+                }
+            };
+            for (const auto& event : events)
+            {
+                printOneRegister(event);
+            }
+            for (const auto& event : fixedEvents)
+            {
+                printOneRegister(event);
             }
         };
         if (type == "core")
@@ -1825,18 +2041,39 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                 }
             }
         }
+        else if (type == "ha")
+        {
+            for (uint32 s = 0; s < m->getNumSockets(); ++s)
+            {
+                for (uint32 mc = 0; mc < m->getMCPerSocket(); ++mc)
+                {
+                    int i = 0;
+                    for (auto& event : events)
+                    {
+                        choose(outputType,
+                            [s, mc]() { cout << "SKT" << s << "HA" << mc << separator; },
+                            [&event, &i]() { if (event.second.empty()) cout << "HAEvent" << i << separator;  else cout << event.second << separator; },
+                            [&]() { cout << getHACounter(mc, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
+                        ++i;
+                    }
+                }
+            }
+        }
         else if (type == "pcu")
         {
             for (uint32 s = 0; s < m->getNumSockets(); ++s)
             {
-                int i = 0;
-                for (auto& event : events)
+                for (uint32 u = 0; u < m->getMaxNumOfUncorePMUs(PCM::PCU_PMU_ID); ++u)
                 {
-                    choose(outputType,
-                        [s]() { cout << "SKT" << s << separator; },
-                        [&event, &i]() { if (event.second.empty()) cout << "PCUEvent" << i << separator;  else cout << event.second << separator; },
-                        [&]() { cout << getPCUCounter(i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
-                    ++i;
+                    int i = 0;
+                    for (auto& event : events)
+                    {
+                        choose(outputType,
+                            [s, u]() { cout << "SKT" << s << "P" << u << separator; },
+                            [&event, &i]() { if (event.second.empty()) cout << "PCUEvent" << i << separator;  else cout << event.second << separator; },
+                            [&]() { cout << getUncoreCounter(PCM::PCU_PMU_ID, u, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
+                        ++i;
+                    }
                 }
             }
         }
@@ -1888,25 +2125,19 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
         }
         else if (type == "pcicfg")
         {
-            auto printPCICFG = [&](const PCM::RawEventConfig& event)
-            {
-                const auto values = getPCICFGEvent(event.first, SysBeforeState, SysAfterState);
-                for (size_t r = 0; r < values.size(); ++r)
-                {
-                    choose(outputType,
-                        [&r]() { cout << "SYSTEM_" << r << separator; },
-                        [&]() { if (event.second.empty()) cout << getPCICFGEventString(event.first, type) << separator;  else cout << event.second << separator; },
-                        [&]() { cout << values[r] << separator; });
-                }
-            };
-            for (const auto& event : events)
-            {
-                printPCICFG(event);
-            }
-            for (const auto& event : fixedEvents)
-            {
-                printPCICFG(event);
-            }
+            printRegisters(getPCICFGEventString, getPCICFGEvent);
+        }
+        else if (type == "tpmi")
+        {
+            printRegisters(getTPMIEventString, getTPMIEvent);
+        }
+        else if (type == "mmio")
+        {
+            printRegisters(getMMIOEventString, getMMIOEvent);
+        }
+        else if (type == "pmt")
+        {
+            printRegisters(getPMTEventString, getPMTEvent);
         }
         else if (type == "ubox")
         {
@@ -1925,7 +2156,7 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                     choose(outputType,
                         [s]() { cout << "SKT" << s << separator; },
                         [&event, &i]() { if (event.second.empty()) cout << "UBOXEvent" << i << separator;  else cout << event.second << separator; },
-                        [&]() { cout << getUBOXCounter(i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
+                        [&]() { cout << getUncoreCounter(PCM::UBOX_PMU_ID, 0, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
                     ++i;
                 }
             }
@@ -1934,7 +2165,7 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
         {
             for (uint32 s = 0; s < m->getNumSockets(); ++s)
             {
-                for (uint32 cbo = 0; cbo < m->getMaxNumOfCBoxes(); ++cbo)
+                for (uint32 cbo = 0; cbo < m->getMaxNumOfUncorePMUs(PCM::CBO_PMU_ID); ++cbo)
                 {
                     int i = 0;
                     for (auto& event : events)
@@ -1942,7 +2173,7 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                         choose(outputType,
                             [s, cbo]() { cout << "SKT" << s << "C" << cbo << separator; },
                             [&event, &i]() { if (event.second.empty()) cout << "CBOEvent" << i << separator;  else cout << event.second << separator; },
-                            [&]() { cout << getCBOCounter(cbo, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
+                            [&]() { cout << getUncoreCounter(PCM::CBO_PMU_ID, cbo, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
                         ++i;
                     }
                 }
@@ -1952,7 +2183,7 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
         {
             for (uint32 s = 0; s < m->getNumSockets(); ++s)
             {
-                for (uint32 mdf = 0; mdf < m->getMaxNumOfMDFs(); ++mdf)
+                for (uint32 mdf = 0; mdf < m->getMaxNumOfUncorePMUs(PCM::MDF_PMU_ID); ++mdf)
                 {
                     int i = 0;
                     for (auto& event : events)
@@ -1960,7 +2191,7 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                         choose(outputType,
                             [s, mdf]() { cout << "SKT" << s << "MDF" << mdf << separator; },
                             [&event, &i]() { if (event.second.empty()) cout << "MDFEvent" << i << separator;  else cout << event.second << separator; },
-                            [&]() { cout << getMDFCounter(mdf, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
+                            [&]() { cout << getUncoreCounter(PCM::MDF_PMU_ID, mdf, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
                         ++i;
                     }
                 }
@@ -2033,6 +2264,24 @@ void print(const PCM::RawPMUConfigs& curPMUConfigs,
                             [s, p]() { cout << "SKT" << s << "CXLDP" << p << separator; },
                             [&event, &i]() { if (event.second.empty()) cout << "CXLDPEvent" << i << separator;  else cout << event.second << separator; },
                             [&]() { cout << getCXLDPCounter(p, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
+                        ++i;
+                    }
+                }
+            }
+        }
+        else if ((pmu_type = m->strToUncorePMUID(type)) != PCM::INVALID_PMU_ID)
+        {
+            for (uint32 s = 0; s < m->getNumSockets(); ++s)
+            {
+                for (uint32 unit = 0; unit < m->getMaxNumOfUncorePMUs(pmu_type); ++unit)
+                {
+                    int i = 0;
+                    for (auto& event : events)
+                    {
+                        choose(outputType,
+                            [s, unit, &type]() { cout << "SKT" << s << type << unit << separator; },
+                            [&event, &i, &type]() { if (event.second.empty()) cout << type << "Event" << i << separator;  else cout << event.second << separator; },
+                            [&]() { cout << getUncoreCounter(pmu_type, unit, i, BeforeUncoreState[s], AfterUncoreState[s]) << separator; });
                         ++i;
                     }
                 }
@@ -2152,6 +2401,8 @@ int mainThrows(int argc, char * argv[])
     bool forceRTMAbortMode = false;
     bool reset_pmu = false;
     PCM* m = PCM::getInstance();
+
+    telemDB.loadFromXML("Intel-PMT");
 
     parsePID(argc, argv, pid);
 

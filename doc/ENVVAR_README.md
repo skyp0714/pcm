@@ -9,3 +9,9 @@
 `PCM_PRINT_TOPOLOGY=1` : print detailed CPU topology
 
 `PCM_KEEP_NMI_WATCHDOG=1` : don't disable NMI watchdog (reducing the core metrics set)
+
+`PCM_NO_MAIN_EXCEPTION_HANDLER=1` :  don't catch exceptions in the main function of pcm tools (a debugging option)
+
+`PCM_ENFORCE_MBM=1` :  force-enable Memory Bandwidth Monitoring (MBM) metrics (LocalMemoryBW = LMB) and (RemoteMemoryBW = RMB) on processors with RDT/MBM errata
+
+`PCM_DEBUG_LEVEL=x` :  x is an integer defining debug output level. level = 0 (default): minimal or no debug info, > 0 increases verbosity

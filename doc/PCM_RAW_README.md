@@ -77,6 +77,55 @@ pcicfg/config=0xe20,config1=0x180,config2=0x0,width=32,name=CHANERR_INT
 ```
 From: https://www.intel.la/content/dam/www/public/us/en/documents/datasheets/xeon-e7-v2-datasheet-vol-2.pdf
 
+MMIO Registers:
+
+```
+mmio/config=<device_id>,config1=<offset>,config2=<static_or_freerun>,config3=<membar_bits1>[,config4=<membar_bits2>],width=<width>[,name=<NAME>]
+```
+
+The MEMBAR is computed by logically ORing the result of membar_bits1 and membar_bits1 computation described below (PCICFG read + bit extraction and shift). The final MMIO register address = MEMBAR + offset.
+
+* width: register width in bits (16,32,64) 
+* dev_id: Intel PCI device id where the membar address registers are located
+* membar_bits1: mmioBase register bits to compute membar (base address)
+  - bits 0-15 : PCICFG register offset to read membar1 bits
+  - bits 16-23: source position of membar bits in the PCICFG register 
+  - bits 24-31: number of bits
+  - bits 32-39: destination bit position in the membar
+* membar_bits2: mmioBase register bits to compute membar (base address), can be zero if only membar_bits1 is sufficient for locating the register.
+  - bits 0-15 : PCICFG register offset to read membar2 bits
+  - bits 16-23: source position of membar bits in the PCICFG register 
+  - bits 24-31: number of bits
+  - bits 32-39: destination bit position in the membar
+* offset: offset of the MMIO register relative to the membar
+* static_or_freerun: same syntax as for MSR registers
+
+Example (Icelake server iMC PMON MMIO register read):
+
+```
+mmio/config=0x3451,config1=0x22808,config2=1,config3=0x171D0000D0,config4=0x0c0b0000d8,width=64
+```
+
+TPMI Registers:
+
+TPMI ([Topology Aware Register and PM Capsule Interface](https://github.com/intel/tpmi_power_management)) can be read with pcm-raw as follows:
+
+```
+tpmi/config=<tpmi_id>,config1=<offset>,config2=<static_or_freerun>[,name=<name>]
+```
+
+* tpmi_id: TPMI id
+* offset: offset of the register
+* static_or_freerun: same syntax as for MSR registers
+
+Example:
+
+```
+tpmi/config=0x2,config1=0x18,name=BHS_UFS_CONTROL
+```
+
+From: https://github.com/intel/tpmi_power_management/blob/main/UFS_TPMI_public_disclosure_FINAL_rev4.pdf
+
 --------------------------------------------------------------------------------
 Collecting Events By Names From Event Lists (https://github.com/intel/perfmon/)
 --------------------------------------------------------------------------------
@@ -164,3 +213,33 @@ Sample csv output (date,time,event_name,milliseconds_between_samples,TSC_cycles_
 2021-09-27,00:07:40.507,UNC_UPI_L1_POWER_CYCLES,1000,2102078418,0,0,1200328715,0,0,1200283803
 ```
 The unit can be logical core, memory channel, CHA, etc, depending on the event type.
+
+--------------------------------------------------------------------------------
+Low-level access to Intel PMT telemetry data
+--------------------------------------------------------------------------------
+
+pcm-raw can read raw telemetry data from Intel PMT (https://github.com/intel/Intel-PMT/).
+
+Syntax for a PMT raw telemetry counter:
+
+```
+pmt/config=<uniqueid>,config1=<sampleID>,config2=<sampleType>,config3=<lsb,config4=<msb>[,name=<description>]
+
+```
+
+The fields are the values for the counter from the Intel PMT aggregator XML:
+
+* uniqueid : Intel PMT Telemetry unique identifier
+* sampleID : sample ID of the counter
+* sampleType counter encoding:
+  -  0        : Snapshot (last value reported in csv)
+  - non-zero  : Counter (delta to last value reported in csv)
+* lsb : lsb field
+* msb : msb field
+
+Example for https://github.com/intel/Intel-PMT/blob/868049006ad2770a75e5fc7526fd0c4b22438e27/xml/SPR/OOBMSM/CORE/spr_aggregator.xml#L15428:
+```
+pmt/config=0x87b6fef1,config1=770,config2=0,config3=32,config4=63,name="Temperature_histogram_range_5_(50.5-57.5C)_counter_for_core_0"
+```
+
+Current limitations: this feature (PMT access) is currently only available on Linux (with Intel PMT Linux driver).

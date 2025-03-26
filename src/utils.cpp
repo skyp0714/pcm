@@ -2,11 +2,16 @@
 // Copyright (c) 2009-2022, Intel Corporation
 // written by Andrey Semin and many others
 
+#include <array>
 #include <iostream>
 #include <cassert>
 #include <climits>
 #include <algorithm>
 #ifdef _MSC_VER
+#include <windows.h>
+#include <accctrl.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <process.h>
 #include <comdef.h>
 #else
@@ -18,9 +23,113 @@
 #include <numeric>
 #ifndef _MSC_VER
 #include <execinfo.h>
+extern char ** environ;
+#endif
+#ifdef __linux__
+#include <glob.h>
 #endif
 
+#include "debug.h"
+
 namespace pcm {
+
+
+bool startsWithPCM(const StringType& varName) {
+    const StringType prefix = PCM_STRING("PCM_");
+    return varName.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool isInKeepList(const StringType& varName, const std::vector<StringType>& keepList) {
+    for (const auto& keepVar : keepList) {
+        if (varName == keepVar) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void setDefaultDebugLevel()
+{
+    auto strDebugLevel = pcm::safe_getenv("PCM_DEBUG_LEVEL");
+    if (strDebugLevel.empty() == false)
+    {
+        auto intDebugLevel = std::stoi(strDebugLevel);
+        debug::dyn_debug_level(intDebugLevel);
+        DBG(0, "Debug level set to ", intDebugLevel);
+    }
+}
+
+void getMCFGRecords(std::vector<MCFGRecord>& mcfg)
+{
+#ifdef __linux__
+    mcfg = PciHandleMM::getMCFGRecords();
+#else
+    MCFGRecord segment;
+    segment.startBusNumber = 0;
+    segment.endBusNumber = 0xff;
+    auto maxSegments = 1;
+#if defined (_MSC_VER) || defined(__FreeBSD__) || defined(__DragonFly__)
+    switch (PCM::getCPUFamilyModelFromCPUID())
+    {
+    case PCM::GNR:
+        maxSegments = 4;
+        break;
+    }
+#endif
+    for (segment.PCISegmentGroupNumber = 0; segment.PCISegmentGroupNumber < maxSegments; ++(segment.PCISegmentGroupNumber))
+    {
+        mcfg.push_back(segment);
+    }
+#endif
+}
+
+#if defined(_MSC_VER)
+
+void eraseEnvironmentVariables(const std::vector<std::wstring>& keepList) {
+    // Get a snapshot of the current environment block
+    LPWCH envBlock = GetEnvironmentStrings();
+    if (!envBlock) {
+        std::cerr << "Error getting environment strings." << std::endl;
+        return;
+    }
+
+    // Iterate over the environment block
+    for (LPWCH var = envBlock; *var != 0; var += std::wcslen(var) + 1) {
+        std::wstring varName(var);
+        size_t pos = varName.find('=');
+        if (pos != std::string::npos) {
+            varName = varName.substr(0, pos);
+            if (!startsWithPCM(varName) && !isInKeepList(varName, keepList)) {
+                SetEnvironmentVariable(varName.c_str(), NULL);
+            }
+        }
+    }
+
+    // Free the environment block
+    FreeEnvironmentStrings(envBlock);
+}
+#else
+void eraseEnvironmentVariables(const std::vector<std::string>& keepList) {
+    std::vector<std::string> varsToDelete;
+
+    // Collect all the variables that need to be deleted
+    for (char **env = environ; *env != nullptr; ++env) {
+        std::string envEntry(*env);
+        size_t pos = envEntry.find('=');
+        if (pos != std::string::npos) {
+            std::string varName = envEntry.substr(0, pos);
+            if (!startsWithPCM(varName) && !isInKeepList(varName, keepList)) {
+                varsToDelete.push_back(varName);
+            }
+        }
+    }
+
+    // Delete the collected variables
+    for (const auto& varName : varsToDelete) {
+        unsetenv(varName.c_str());
+    }
+}
+#endif
 
 void (*post_cleanup_callback)(void) = NULL;
 
@@ -42,6 +151,59 @@ void exit_cleanup(void)
     }
 }
 
+
+#ifdef _MSC_VER
+bool colorEnabled = false;
+#else
+bool colorEnabled = true;
+#endif
+
+void setColorEnabled(bool value)
+{
+    colorEnabled = value;
+}
+
+const char * setColor (const char * colorStr)
+{
+    return colorEnabled ? colorStr : "";
+}
+
+template<typename T, typename... N>
+constexpr auto make_array(N&&... args) -> std::array<T, sizeof...(args)>
+{
+    return {std::forward<N>(args)...};
+}
+
+constexpr auto colorTable{make_array<const char*>(
+    ASCII_GREEN,
+    ASCII_YELLOW,
+    ASCII_MAGENTA,
+    ASCII_CYAN,
+    ASCII_BRIGHT_GREEN,
+    ASCII_BRIGHT_YELLOW,
+    ASCII_BRIGHT_BLUE,
+    ASCII_BRIGHT_MAGENTA,
+    ASCII_BRIGHT_CYAN,
+    ASCII_BRIGHT_WHITE
+)};
+
+size_t currentColor = 0;
+const char * setNextColor()
+{
+    const auto result = setColor(colorTable[currentColor++]);
+    if (currentColor == colorTable.size())
+    {
+        currentColor = 0;
+    }
+    return result;
+}
+
+const char * resetColor()
+{
+    currentColor = 0;
+    return setColor(ASCII_RESET_COLOR);
+}
+
 void print_cpu_details()
 {
     const auto m = PCM::getInstance();
@@ -54,6 +216,24 @@ void print_cpu_details()
     }
     std::cerr << "\n";
 }
+
+#ifdef __linux__
+std::vector<std::string> findPathsFromPattern(const char* pattern)
+{
+            std::vector<std::string> result;
+            glob_t glob_result;
+            memset(&glob_result, 0, sizeof(glob_result));
+            if (glob(pattern, GLOB_TILDE, nullptr, &glob_result) == 0)
+            {
+                for (size_t i = 0; i < glob_result.gl_pathc; ++i)
+                {
+                    result.push_back(glob_result.gl_pathv[i]);
+                }
+            }
+            globfree(&glob_result);
+            return result;
+};
+#endif
 
 #ifdef _MSC_VER
 
@@ -192,16 +372,11 @@ void sigINT_handler(int signum)
     }
 }
 
-/**
- * \brief handles SIGSEGV signals that lead to termination of the program
- * this function specifically works when the client application launched
- * by pcm -- terminates
- */
 constexpr auto BACKTRACE_MAX_STACK_FRAME = 30;
-void sigSEGV_handler(int signum)
+void printBacktrace()
 {
-    void *backtrace_buffer[BACKTRACE_MAX_STACK_FRAME] = {0};
-    char **backtrace_strings = NULL;
+    void* backtrace_buffer[BACKTRACE_MAX_STACK_FRAME] = { 0 };
+    char** backtrace_strings = NULL;
     size_t backtrace_size = 0;
 
     backtrace_size = backtrace(backtrace_buffer, BACKTRACE_MAX_STACK_FRAME);
@@ -217,10 +392,18 @@ void sigSEGV_handler(int signum)
         {
             std::cerr << backtrace_strings[i] << "\n";
         }
-        free(backtrace_strings);
-        backtrace_strings = NULL;
+        freeAndNullify(backtrace_strings);
     }
+}
 
+/**
+ * \brief handles SIGSEGV signals that lead to termination of the program
+ * this function specifically works when the client application launched
+ * by pcm -- terminates
+ */
+void sigSEGV_handler(int signum)
+{
+    printBacktrace();
     sigINT_handler(signum);
 }
 
@@ -322,15 +505,16 @@ void set_signal_handlers(void)
         std::cerr << "\nPCM ERROR: _dupenv_s failed.\n";
         _exit(EXIT_FAILURE);
     }
-    free(envPath);
     if (envPath)
     {
         std::cerr << "\nPCM ERROR: Detected cygwin/mingw environment which does not allow to setup PMU clean-up handlers on Ctrl-C and other termination signals.\n";
         std::cerr << "See https://www.mail-archive.com/cygwin@cygwin.com/msg74817.html\n";
         std::cerr << "As a workaround please run pcm directly from a native windows shell (e.g. cmd).\n";
         std::cerr << "Exiting...\n\n";
+        freeAndNullify(envPath);
         _exit(EXIT_FAILURE);
     }
+    freeAndNullify(envPath);
     std::cerr << "DEBUG: Setting Ctrl+C done.\n";
 
 #else
@@ -662,7 +846,7 @@ int calibratedSleep(const double delay, const char* sysCmd, const MainLoop& main
     {
         if (delay_ms > 0)
         {
-            // std::cerr << "DEBUG: sleeping for " << std::dec << delay_ms << " ms...\n";
+            DBG(1, "sleeping for " , std::dec , delay_ms , " ms...");
             MySleepMs(delay_ms);
         }
     }
@@ -674,16 +858,31 @@ int calibratedSleep(const double delay, const char* sysCmd, const MainLoop& main
 
 void print_help_force_rtm_abort_mode(const int alignment, const char * separator)
 {
-    const auto m = PCM::getInstance();
-    if (m->isForceRTMAbortModeAvailable() && (m->getMaxCustomCoreEvents() < 4))
+    if (PCM::isForceRTMAbortModeAvailable() == false)
     {
-        std::cout << "  -force-rtm-abort-mode";
-        for (int i = 0; i < (alignment - 23); ++i)
+        return;
+    }
+    try
+    {
+        const auto m = PCM::getInstance();
+        if (m->getMaxCustomCoreEvents() < 4)
         {
-            std::cout << " ";
+            std::cout << "  -force-rtm-abort-mode";
+            for (int i = 0; i < (alignment - 23); ++i)
+            {
+                std::cout << " ";
+            }
+            assert(separator);
+            std::cout << separator << " force RTM transaction abort mode to enable more programmable counters\n";
         }
-        assert(separator);
-        std::cout << separator << " force RTM transaction abort mode to enable more programmable counters\n";
+    }
+    catch (std::exception & e)
+    {
+        std::cerr << "ERROR: " << e.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cerr << "ERROR: Unknown exception caught in print_help_force_rtm_abort_mode\n";
     }
 }
 
@@ -695,7 +894,7 @@ std::string safe_getenv(const char* env)
     if (_dupenv_s(&buffer, NULL, env) == 0 && buffer != nullptr)
     {
         result = buffer;
-        free(buffer);
+        freeAndNullify(buffer);
     }
     return result;
 }
@@ -744,6 +943,43 @@ double parse_delay(const char *arg, const std::string& progname, print_usage_fun
         }
         exit(EXIT_FAILURE);
     }
+}
+
+std::list<int> extract_integer_list(const char *optarg){
+    const char *pstr = optarg;
+    std::list<int> corelist;
+    std::string snum1, snum2;
+    std::string *pnow = &snum1;
+    char nchar = ',';
+    while(*pstr != '\0' || nchar != ','){
+        nchar = ',';
+        if (*pstr != '\0'){
+            nchar = *pstr;
+            pstr++;
+        } 
+        //printf("c=%c\n",nchar);
+        if (nchar=='-' && pnow == &snum1 && snum1.size()>0){
+            pnow = &snum2;
+        }else if (nchar == ','){
+            if (!snum1.empty() && !snum2.empty()){
+                int num1 = atoi(snum1.c_str()), num2 =atoi(snum2.c_str());
+                if (num2 < num1) std::swap(num1,num2);
+                if (num1 < 0) num1 = 0;
+                for (int ix=num1; ix <= num2; ix++){
+                    corelist.push_back(ix);
+                }
+            }else if (!snum1.empty()){
+                int num1 = atoi(snum1.c_str());
+                corelist.push_back(num1);
+            }
+            snum1.clear();
+            snum2.clear();
+            pnow = &snum1;
+        }else if (nchar != ' '){
+            pnow->push_back(nchar);
+        }
+    }
+    return(corelist);
 }
 
 bool extract_argument_value(const char* arg, std::initializer_list<const char*> arg_names, std::string& value)
@@ -836,6 +1072,20 @@ std::string dos2unix(std::string in)
         in.erase(in.length() - 1);
     }
     return in;
+}
+
+bool isRegisterEvent(const std::string & pmu)
+{
+    if (pmu == "mmio"
+       || pmu == "pcicfg"
+       || pmu == "pmt"
+       || pmu == "tpmi"
+       || pmu == "package_msr"
+       || pmu == "thread_msr")
+    {
+        return true;
+    }
+    return false;
 }
 
 std::string a_title(const std::string &init, const std::string &name) {
@@ -945,7 +1195,7 @@ int load_events(const std::string &fn, std::map<std::string, uint32_t> &ofm,
     std::string line, item;
     if (!in.is_open())
     {
-        const auto alt_fn = std::string("/usr/share/pcm/") + fn;
+        const auto alt_fn = getInstallPathPrefix() + fn;
         in.open(alt_fn);
         if (!in.is_open())
         {
@@ -1011,7 +1261,7 @@ int load_events(const std::string &fn, std::map<std::string, uint32_t> &ofm,
                         nameMap[h_name] = nameMap_value;
                     }
                     ctr.h_id = (uint32_t)nameMap.size() - 1;
-                    //cout << "h_name:" << ctr.h_event_name << "h_id: "<< ctr.h_id << "\n";
+                    DBG(2, "h_name:" , ctr.h_event_name , "h_id: ", ctr.h_id);
                     break;
                 case PCM::V_EVENT_NAME:
                     {
@@ -1023,7 +1273,7 @@ int load_events(const std::string &fn, std::map<std::string, uint32_t> &ofm,
                         if (v_nameMap.find(v_name) == v_nameMap.end())
                         {
                             v_nameMap[v_name] = (unsigned int)v_nameMap.size() - 1;
-                            //cout << "v_name(" << v_name << ")="<< v_nameMap[v_name] << "\n";
+                            DBG(2, "v_name(" , v_name , ")=", v_nameMap[v_name]);
                         }
                         else
                         {
@@ -1032,7 +1282,7 @@ int load_events(const std::string &fn, std::map<std::string, uint32_t> &ofm,
                             throw std::invalid_argument(err_msg);
                         }
                         ctr.v_id = (uint32_t)v_nameMap.size() - 1;
-                        //cout << "h_name:" << ctr.h_event_name << ",hid=" << ctr.h_id << ",v_name:" << ctr.v_event_name << ",v_id: "<< ctr.v_id << "\n";
+                        DBG(2, "h_name:" , ctr.h_event_name , ",hid=" , ctr.h_id , ",v_name:" , ctr.v_event_name , ",v_id: ", ctr.v_id);
                         break;
                     }
                 //TODO: double type for multiplier. drop divider variable
@@ -1057,7 +1307,7 @@ int load_events(const std::string &fn, std::map<std::string, uint32_t> &ofm,
             }
         }
 
-        //std::cout << "Finish parsing: " << line << "\n";
+        DBG(2, "Finished parsing: " , line);
         if (pfn_evtcb(EVT_LINE_COMPLETE, evtcb_ctx, ctr, ofm, "", 0))
         {
             in.close();
@@ -1081,51 +1331,72 @@ int load_events(const std::string &fn, std::map<std::string, uint32_t> &ofm,
 
 bool get_cpu_bus(uint32 msmDomain, uint32 msmBus, uint32 msmDev, uint32 msmFunc, uint32 &cpuBusValid, std::vector<uint32> &cpuBusNo, int &cpuPackageId)
 {
-    int cpuBusNo0 = 0x0;
-    uint32 sadControlCfg = 0x0;
-    uint32 busNo = 0x0;
-
-    //std::cout << "get_cpu_bus: d=" << std::hex << msmDomain << ",b=" << msmBus << ",d=" << msmDev << ",f=" << msmFunc << std::dec << " \n";
-    PciHandleType h(msmDomain, msmBus, msmDev, msmFunc);
-
-    h.read32(SPR_MSM_REG_CPUBUSNO_VALID_OFFSET, &cpuBusValid);
-    if (cpuBusValid == (std::numeric_limits<uint32>::max)()) {
-        std::cerr << "Failed to read CPUBUSNO_VALID" << std::endl;
-        return false;
-    }
-
-    for (int i = 0; i < 8; ++i)
+    DBG(2, "get_cpu_bus: d=" , std::hex , msmDomain , ",b=" , msmBus , ",d=" , msmDev , ",f=" , msmFunc , std::dec );
+    try
     {
-        busNo = 0x00;
-        if (i <= 3)
-        {
-            h.read32(SPR_MSM_REG_CPUBUSNO0_OFFSET + i*4, &busNo);
-        }
-        else
-        {
-            h.read32(SPR_MSM_REG_CPUBUSNO4_OFFSET + (i-4)*4, &busNo);
-        }
-        if (busNo == (std::numeric_limits<uint32>::max)())
-        {
-            std::cerr << "Failed to read CPUBUSNO" << std::endl;
+        PciHandleType h(msmDomain, msmBus, msmDev, msmFunc);
+
+        h.read32(SPR_MSM_REG_CPUBUSNO_VALID_OFFSET, &cpuBusValid);
+        if (cpuBusValid == (std::numeric_limits<uint32>::max)()) {
+            std::cerr << "Failed to read CPUBUSNO_VALID" << std::endl;
             return false;
         }
-        cpuBusNo.push_back(busNo);
-        //std::cout << std::hex << "get_cpu_bus: busNo=0x" << busNo << std::dec <<  "\n";
+
+        cpuBusNo.resize(8);
+        for (int i = 0; i < 4; ++i) {
+            h.read32(SPR_MSM_REG_CPUBUSNO0_OFFSET + i * 4, &cpuBusNo[i]);
+
+            h.read32(SPR_MSM_REG_CPUBUSNO4_OFFSET + i * 4, &cpuBusNo[i + 4]);
+
+            if (cpuBusNo[i] == (std::numeric_limits<uint32>::max)() ||
+                cpuBusNo[i + 4] == (std::numeric_limits<uint32>::max)()) {
+                std::cerr << "Failed to read CPUBUSNO registers" << std::endl;
+                return false;
+            }
+        }
+
+        /*
+        * It's possible to have not enabled first stack that's why
+        * need to find the first valid bus to read CSR
+        */
+        int firstValidBusId = 0;
+        while (!((cpuBusValid >> firstValidBusId) & 0x1)) firstValidBusId++;
+        int cpuBusNo0 = (cpuBusNo[(int)(firstValidBusId / 4)] >> ((firstValidBusId % 4) * 8)) & 0xff;
+
+        uint32 sadControlCfg = 0x0;
+        PciHandleType sad_cfg_handler(msmDomain, cpuBusNo0, 0, 0);
+        sad_cfg_handler.read32(SPR_SAD_REG_CTL_CFG_OFFSET, &sadControlCfg);
+        if (sadControlCfg == (std::numeric_limits<uint32>::max)()) {
+            std::cerr << "Failed to read SAD_CONTROL_CFG" << std::endl;
+            return false;
+        }
+        cpuPackageId = sadControlCfg & 0xf;
+
+        return true;
     }
-
-    cpuBusNo0 = cpuBusNo[0] & 0xff;
-    PciHandleType sad_cfg_handler(msmDomain, cpuBusNo0, 0, 0);
-
-    sad_cfg_handler.read32(SPR_SAD_REG_CTL_CFG_OFFSET, &sadControlCfg);
-    if (sadControlCfg == (std::numeric_limits<uint32>::max)())
+    catch (...)
     {
-        std::cerr << "Failed to read SAD_CONTROL_CFG" << std::endl;
+        std::cerr << "Warning: unable to enumerate CPU Buses" << std::endl;
         return false;
     }
-    cpuPackageId = sadControlCfg & 0xf;
+}
 
-    return true;
+std::pair<int64,int64> parseBitsParameter(const char * param)
+{
+    std::pair<int64,int64> bits{-1, -1};
+    const auto bitsArray = pcm::split(std::string(param),':');
+    assert(bitsArray.size() == 2);
+    bits.first = (int64)read_number(bitsArray[0].c_str());
+    bits.second = (int64)read_number(bitsArray[1].c_str());
+    assert(bits.first >= 0);
+    assert(bits.second >= 0);
+    assert(bits.first < 64);
+    assert(bits.second < 64);
+    if (bits.first > bits.second)
+    {
+        std::swap(bits.first, bits.second);
+    }
+    return bits;
 }
 
 #ifdef __linux__
@@ -1212,11 +1483,41 @@ bool readMapFromSysFS(const char * path, std::unordered_map<std::string, uint32>
         std::istringstream iss2(value);
         iss2 >> std::setbase(0) >> numValue;
         result.insert(std::pair<std::string, uint32>(key, numValue));
-        //std::cerr << "readMapFromSysFS:" << key << "=" << numValue << ".\n";
+        DBG(3, "readMapFromSysFS:" , key , "=" , numValue , ".");
     }
 
     fclose(f);
     return true;
+}
+#endif
+
+#ifdef _MSC_VER
+
+//! restrict usage of driver to system (SY) and builtin admins (BA)
+void restrictDriverAccessNative(LPCTSTR path)
+{
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+        _T("O:BAG:SYD:(A;;FA;;;SY)(A;;FA;;;BA)"),
+        SDDL_REVISION_1,
+        &pSD,
+        nullptr))
+    {
+        _tprintf(TEXT("Error in ConvertStringSecurityDescriptorToSecurityDescriptor: %d\n"), GetLastError());
+        return;
+    }
+
+    if (SetFileSecurity(path, DACL_SECURITY_INFORMATION, pSD))
+    {
+        // _tprintf(TEXT("Successfully restricted access for %s\n"), path);
+    }
+    else
+    {
+        _tprintf(TEXT("Error in SetFileSecurity for %s. Error %d\n"), path, GetLastError());
+    }
+
+    LocalFree(pSD);
 }
 #endif
 

@@ -14,6 +14,8 @@
 */
 
 #include "types.h"
+#include "debug.h"
+#include "utils.h"
 
 #ifdef _MSC_VER
 #include "windows.h"
@@ -37,6 +39,9 @@ class PciHandle
     int32 fd;
 #endif
 
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+    uint32 groupnr;
+#endif
     uint32 bus;
     uint32 device;
     uint32 function;
@@ -157,19 +162,6 @@ public:
 
 #endif
 
-inline void getMCFGRecords(std::vector<MCFGRecord> & mcfg)
-{
-    #ifdef __linux__
-    mcfg = PciHandleMM::getMCFGRecords();
-    #else
-    MCFGRecord segment;
-    segment.PCISegmentGroupNumber = 0;
-    segment.startBusNumber = 0;
-    segment.endBusNumber = 0xff;
-    mcfg.push_back(segment);
-    #endif
-}
-
 template <class F>
 inline void forAllIntelDevices(F f, int requestedDevice = -1, int requestedFunction = -1)
 {
@@ -178,6 +170,7 @@ inline void forAllIntelDevices(F f, int requestedDevice = -1, int requestedFunct
 
     auto probe = [&f](const uint32 group, const uint32 bus, const uint32 device, const uint32 function)
     {
+        DBG(3, "Probing " , std::hex , group , ":" , bus , ":" , device , ":" , function , " " , std::dec);
         uint32 value = 0;
         try
         {
@@ -191,6 +184,7 @@ inline void forAllIntelDevices(F f, int requestedDevice = -1, int requestedFunct
         }
         const uint32 vendor_id = value & 0xffff;
         const uint32 device_id = (value >> 16) & 0xffff;
+        DBG(3, "Found dev " , std::hex , vendor_id , ":" , device_id , std::dec);
         if (vendor_id != PCM_INTEL_PCI_VENDOR_ID)
         {
             return;
@@ -231,6 +225,76 @@ inline void forAllIntelDevices(F f, int requestedDevice = -1, int requestedFunct
             }
         }
     }
+}
+
+union VSEC {
+    struct {
+        uint64 cap_id:16;
+        uint64 cap_version:4;
+        uint64 cap_next:12;
+        uint64 vsec_id:16;
+        uint64 vsec_version:4;
+        uint64 vsec_length:12;
+        uint64 entryID:16;
+        uint64 NumEntries:8;
+        uint64 EntrySize:8;
+        uint64 tBIR:3;
+        uint64 Address:29;
+    } fields;
+    uint64 raw_value64[2];
+    uint32 raw_value32[4];
+};
+
+template <class MatchFunc, class ProcessFunc>
+void processDVSEC(MatchFunc matchFunc, ProcessFunc processFunc)
+{
+    forAllIntelDevices([&](const uint32 group, const uint32 bus, const uint32 device, const uint32 function, const uint32 device_id)
+    {
+        DBG(2, "Intel device scan.found " , std::hex , group , ":" , bus , " : " , device , " : " , function , " " , device_id);
+        uint32 status{0};
+        PciHandleType h(group, bus, device, function);
+        h.read32(4, &status); // read status
+        if (status & 0x100000) // has capability list
+        {
+            DBG(2, "Intel device scan. found ", std::hex , group , ":" , bus , ":" , device , ":" , function , " " , device_id , " with capability list");
+            VSEC header;
+            uint64 offset = 0x100;
+            do
+            {
+                if (offset == 0 || h.read32(offset, &header.raw_value32[0]) != sizeof(uint32) || header.raw_value32[0] == 0)
+                {
+                    return;
+                }
+                if (h.read64(offset, &header.raw_value64[0]) != sizeof(uint64) || h.read64(offset + sizeof(uint64), &header.raw_value64[1]) != sizeof(uint64))
+                {
+                    return;
+                }
+                DBG(2, "offset 0x" , std::hex , offset , " cap_id: 0x" , header.fields.cap_id , " vsec_id: 0x", header.fields.vsec_id, " entryID: 0x" , std::hex , header.fields.entryID , std::dec);
+                if (matchFunc(header))
+                {
+                    DBG(2, ".... found match");
+                    auto barOffset = 0x10 + header.fields.tBIR * 4;
+                    uint32 bar = 0;
+                    if (h.read32(barOffset, &bar) == sizeof(uint32) && bar != 0) // read bar
+                    {
+                        bar &= ~4095;
+                        processFunc(bar, header);
+                    }
+                    else
+                    {
+                        std::cerr << "Error: can't read bar from offset " << barOffset << " \n";
+                    }
+                }
+                const uint64 lastOffset = offset;
+                offset = header.fields.cap_next & ~3;
+                if (lastOffset == offset) // the offset did not change
+                {
+                    DBG(2, " lastOffset == offset ", lastOffset , "==", offset);
+                    return; // deadlock protection
+                }
+            } while (1);
+        }
+    });
 }
 
 } // namespace pcm

@@ -4,7 +4,6 @@
 // written by Patrick Lu
 #include "cpucounters.h"
 #ifdef _MSC_VER
-#pragma warning(disable : 4996) // for sprintf
 #include <windows.h>
 #include "windows/windriver.h"
 #else
@@ -50,10 +49,11 @@ void scanBus(int bus, const PCIDB & pciDB)
                 bdf->busno = busno;
                 bdf->devno = part;
                 bdf->funcno = 0;
-                if (stack != 0 && busno == 0) /* This is a workaround to catch some IIO stack does not exist */
+                /* This is a workaround to catch some IIO stack does not exist */
+                if (stack != 0 && busno == 0)
                     pci->exist = false;
                 else
-                    probe_pci(pci);
+                    (void)probe_pci(pci);
             }
         }
     for (uint8_t stack = 0; stack < 6; stack++) {
@@ -69,8 +69,7 @@ void scanBus(int bus, const PCIDB & pciDB)
                         pci.bdf.busno = b;
                         pci.bdf.devno = d;
                         pci.bdf.funcno = f;
-                        probe_pci(&pci);
-                        if (pci.exist)
+                        if (probe_pci(&pci))
                             iio_skx.stacks[stack].parts[part].child_pci_devs.push_back(pci);
                     }
                 }
@@ -104,7 +103,7 @@ int mainThrows(int /*argc*/, char * /*argv*/[])
 
     if (!m->isSkxCompatible())
     {
-        cerr << "PCI tree display is currently not supported for processor model " << m->getCPUModel() << "\n";
+        cerr << "PCI tree display is currently not supported for processor family/model 0x" << std::hex << m->getCPUFamilyModel() << std::dec << "\n";
     }
     else
     {
@@ -125,8 +124,8 @@ int mainThrows(int /*argc*/, char * /*argv*/[])
                     PciHandleType h(0, bus, device, function);
                     uint32 value = 0;
                     h.read32(0, &value);
-                    const uint32 vendor = extract_bits_ui(value, 0, 15);
-                    const uint32 deviceID = extract_bits_ui(value, 16, 31);
+                    const uint32 vendor = extract_bits_32(value, 0, 15);
+                    const uint32 deviceID = extract_bits_32(value, 16, 31);
                     std::cout << "0:" << bus << ":" << device << ":" << function << " vendor 0x" << std::hex << vendor << " device 0x" << deviceID << std::dec << "\n";
                 }
             }

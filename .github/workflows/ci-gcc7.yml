@@ -6,33 +6,31 @@ on:
   pull_request:
     branches: [ '**' ]
 
+permissions:
+  contents: read
+
 jobs:
   build:
 
-    runs-on: ci-gcc7
+    runs-on: ci-gcc9
     if: ${{ github.repository != 'intel/pcm' }}
 
     steps:
-    - uses: actions/checkout@v3
-    - name: install simdjson
-      uses: actions/checkout@v3
+    - name: Harden Runner
+      uses: step-security/harden-runner@17d0e2bd7d51742c71671bd19fa12bdc9d40a3d6 # v2.8.1
       with:
-        repository: simdjson/simdjson
-        path: src/simdjson
+        egress-policy: audit
+
+    - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      with:
+        submodules: recursive
     - name: Configure CMake
       run: |
         cmake --version
-        rm -rf ${{ github.workspace }}/build && mkdir ${{ github.workspace }}/build
-        cd ${{ github.workspace }}/build
-        cmake -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/build ..
-    - name: Build
+        rm -rf ${{ github.workspace }}/build
+        CXX=g++-7 CC=gcc-7 cmake -B ${{ github.workspace }}/build -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/build
+    - name: Build and Install
       run: |
-        g++ --version
-        cd ${{ github.workspace }}/build
-        make -j$(nproc)
-    - name: Install
-      run: |
+        g++-7 --version
         cd ${{ github.workspace }}/build
         make install -j$(nproc)
-    - name: Diagnostic
-      run: date
